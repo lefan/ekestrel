@@ -45,9 +45,9 @@ init([]) ->
     {ok, Pools} = application:get_env(ekestrel, pools),
     PoolSpecs = lists:map(fun({PoolName, PoolConfig}) ->
 				  Args = [{name, {local, PoolName}},
-					  {worker_module, memcached_worker}]
+					  {worker_module, memcached}]
 				      ++ PoolConfig,
 				  {PoolName, {poolboy, start_link, [Args]},
-				   permanent, 5000, worker, [poolboy]}
+				   temporary, 5000, worker, [poolboy]}
 			  end, Pools),
     {ok, { {one_for_one, 10, 10}, PoolSpecs} }.

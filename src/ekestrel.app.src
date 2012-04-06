@@ -11,8 +11,8 @@
   {env, [
       {pools, [
          {kestr1, [
-	    {size, 3},
-	    {max_overflow,5},
+	    {size, 1},
+	    {max_overflow, 0},
 	    {hostname, "127.0.0.1"},
 	    {port, 11211}
 	 ]}
