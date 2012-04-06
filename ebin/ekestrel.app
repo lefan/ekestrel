@@ -1,0 +1,12 @@
+{application,ekestrel,
+             [{description,"Erlang Kestrel client library"},
+              {vsn,"0.1"},
+              {registered,[]},
+              {applications,[kernel,stdlib]},
+              {mod,{ekestrel,[]}},
+              {env,[{pools,[{kestr1,[{size,3},
+                                     {max_overflow,5},
+                                     {hostname,"127.0.0.1"},
+                                     {port,11211}]}]}]},
+              {modules,[chash,ekestrel,ekestrel_app,ekestrel_sup,memcached,
+                        memcached_worker]}]}.
