@@ -36,6 +36,7 @@
 %%%-------------------------------------------------------------------
 -module(memcached).
 -behaviour(gen_server).
+-behaviour(poolboy_worker).
 
 %% API
 -export([connect/1, connect/2, disconnect/1,
@@ -55,24 +56,33 @@
          split/1,
          flush_all/1, flush_all/2
         ]).
-
+-export([start_link/1]).
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
+-record(state, {socket}).
+
 %%====================================================================
 %% Definitions
 %%====================================================================
--define(TCP_OPTIONS, [binary, {packet, raw}, {nodelay, true}, {reuseaddr, true}, {active, false},
-                      {sndbuf,16384},{recbuf,4096},{keepalive,true}]).
+-define(TCP_OPTIONS, [binary, {packet, raw}, {nodelay, true}, {active, false},
+                      {sndbuf,16384},{recbuf,4096},{keepalive,true},{send_timeout,1000},{send_timeout_close,true}]).
 -define(TIMEOUT, 10000).
 -define(CR, 13).
 -define(LF, 10).
+
+-define(DEBUG(Format, Args),io:format("~s.~w: DEBUG: " ++ Format, [ ?MODULE, ?LINE | Args])).
+%-define(DEBUG(Format, Args), true).
 
 %%====================================================================
 %% API
 %%====================================================================
 
+start_link(Args) ->
+    Host = proplists:get_value(hostname, Args),
+    Port = proplists:get_value(port, Args),
+    connect(Host, Port).
 
 %% @spec connect(Host::string(), Port::integer()) -> {ok, Conn} | {error, Reason}
 connect(Host, Port) ->
@@ -333,24 +343,11 @@ disconnect(Conn) ->
 init([Host, Port]) ->
     case gen_tcp:connect(Host, Port, ?TCP_OPTIONS) of
         {ok, Socket} ->
-            Server = Host ++ integer_to_list(Port),
-            CHash = chash:new(memcached),
-            ok = chash:add_node(CHash, Server, Server),
-            Connections = ets:new(connections, [set, protected]),
-            true = ets:insert(Connections, {Server, {Host, Port}}),
-            {ok, {Connections, CHash, Socket}};
+            {ok, #state{socket=Socket}};
         {error, Reason} ->
             {stop, Reason};
         Other ->
             {stop, Other}
-    end.
-
-call_with_socket(Fun, Key, Connections, CHash, _Socket) ->
-    case get_socket(Key, Connections, CHash) of
-        {ok, Socket, NewConnections} ->
-            apply(Fun, [Socket, NewConnections]);
-        {error, Reason} ->
-            {reply, {error, Reason}, {Connections, CHash, _Socket}}
     end.
 
 %%--------------------------------------------------------------------
@@ -362,217 +359,201 @@ call_with_socket(Fun, Key, Connections, CHash, _Socket) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
-handle_call({get, Key}, _From, {Connections, CHash, _Socket}) ->
-    call_with_socket(
-      fun(Socket, NewConnections) ->
+handle_call({get, Key}, _From, #state{socket=Socket}=State) ->
               case get_command(Socket, "get", [Key]) of
                   {ok, []} ->
-                      {reply, {error, not_found}, {NewConnections, CHash, Socket}};
+                      {reply, {error, not_found}, State};
                   {ok, [{_Key, Value, _CasUnique64}]} ->
-                      {reply, {ok, binary_to_term(Value)}, {NewConnections, CHash, Socket}};
+                      {reply, {ok, binary_to_term(Value)},  State};
                   Other ->
-                      {reply, Other, {NewConnections, CHash, Socket}}
-              end
-      end,
-      Key, Connections, CHash, _Socket);
+                      {stop, Other,  State}
+              end;
 
 
-handle_call({gets, Key}, _From, {Connections, CHash, _Socket}) ->
-    call_with_socket(
-      fun(Socket, NewConnections) ->
+handle_call({gets, Key}, _From, #state{socket=Socket}=State) ->
               case get_command(Socket, "gets", [Key]) of
                   {ok, []} ->
-                      {reply, {error, not_found}, {NewConnections, CHash, Socket}};
+                      {reply, {error, not_found}, State};
                   {ok, [{_Key, Value, CasUnique64}]} ->
-                      {reply, {ok, binary_to_term(Value), CasUnique64}, {NewConnections, CHash, Socket}};
+                      {reply, {ok, binary_to_term(Value), CasUnique64}, State};
                   Other ->
-                      {reply, Other, {NewConnections, CHash, Socket}}
-              end
-      end,
-      Key, Connections, CHash, _Socket);
+                      {stop, Other, State}
+              end;
 
 
-handle_call({getb, Key}, _From, {Connections, CHash, _Socket}) ->
-    call_with_socket(
-      fun(Socket, NewConnections) ->
+handle_call({getb, Key}, _From, #state{socket=Socket}=State) ->
               case get_command(Socket, "get", [Key]) of
                   {ok, []} ->
-                      {reply, {error, not_found}, {NewConnections, CHash, Socket}};
+                      {reply, {error, not_found}, State};
                   {ok, [{_Key, Value, _CasUnique64}]} ->
-                      {reply, {ok, Value}, {NewConnections, CHash, Socket}};
+                      {reply, {ok, Value}, State};
                   Other ->
-                      {reply, Other, {NewConnections, CHash, Socket}}
-              end
-      end,
-      Key, Connections, CHash, _Socket);
+                      {stop, Other, State}
+              end;
 
 
-handle_call({getsb, Key}, _From, {Connections, CHash, _Socket}) ->
-    call_with_socket(
-      fun(Socket, NewConnections) ->
+handle_call({getsb, Key}, _From, #state{socket=Socket}=State) ->
               case get_command(Socket, "gets", [Key]) of
                   {ok, []} ->
-                      {reply, {error, not_found}, {NewConnections, CHash, Socket}};
+                      {reply, {error, not_found}, State};
                   {ok, [{_Key, Value, CasUnique64}]} ->
-                      {reply, {ok, Value, CasUnique64}, {NewConnections, CHash, Socket}};
+                      {reply, {ok, Value, CasUnique64}, State};
                   Other ->
-                      {reply, Other, {NewConnections, CHash, Socket}}
-              end
-      end,
-      Key, Connections, CHash, _Socket);
+                      {stop, Other, State}
+              end;
 
 
-handle_call({get_multi, Keys}, _From, {Connections, CHash, Socket}) ->
+handle_call({get_multi, Keys}, _From, #state{socket=Socket}=State) ->
     case get_command(Socket, "get", Keys) of
         {ok, BinaryValues} ->
             Values = lists:map(fun({Key, Value, _CasUnique64}) -> {Key, binary_to_term(Value)} end, BinaryValues),
-            {reply, {ok, Values}, {Connections, CHash, Socket}};
+            {reply, {ok, Values}, #state{socket=Socket}=State};
         Other ->
-            {reply, Other, {Connections, CHash, Socket}}
+            {stop, Other, #state{socket=Socket}=State}
     end;
 
 
-handle_call({get_multib, Keys}, _From, {Connections, CHash, Socket}) ->
+handle_call({get_multib, Keys}, _From, #state{socket=Socket}=State) ->
     case get_command(Socket, "get", Keys) of
         {ok, BinaryValues} ->
             Values = lists:map(fun({Key, BinaryValue, _CasUnique64}) -> {Key, BinaryValue} end, BinaryValues),
-            {reply, {ok, Values}, {Connections, CHash, Socket}};
+            {reply, {ok, Values}, #state{socket=Socket}=State};
         Other ->
-            {reply, Other, {Connections, CHash, Socket}}
+            {reply, Other, #state{socket=Socket}=State}
     end;
 
 
-handle_call({gets_multi, Keys}, _From, {Connections, CHash, Socket}) ->
+handle_call({gets_multi, Keys}, _From, #state{socket=Socket}=State) ->
     case get_command(Socket, "gets", Keys) of
         {ok, BinaryValues} ->
             Values = lists:map(fun({Key, Value, CasUnique64}) -> {Key, binary_to_term(Value), CasUnique64} end, BinaryValues),
-            {reply, {ok, Values}, {Connections, CHash, Socket}};
+            {reply, {ok, Values}, #state{socket=Socket}=State};
         Other ->
-            {reply, Other, {Connections, CHash, Socket}}
+            {stop, Other, #state{socket=Socket}=State}
     end;
 
 
-handle_call({gets_multib, Keys}, _From, {Connections, CHash, Socket}) ->
+handle_call({gets_multib, Keys}, _From, #state{socket=Socket}=State) ->
     case get_command(Socket, "gets", Keys) of
         {ok, BinaryValues} ->
             Values = lists:map(fun({Key, Value, CasUnique64}) -> {Key, Value, CasUnique64} end, BinaryValues),
-            {reply, {ok, Values}, {Connections, CHash, Socket}};
+            {reply, {ok, Values}, #state{socket=Socket}=State};
         Other ->
-            {reply, Other, {Connections, CHash, Socket}}
+            {stop, Other, #state{socket=Socket}=State}
     end;
 
 
-handle_call({setb, Key, Value}, _From, {Connections, CHash, Socket}) ->
-    storage_command(Connections, CHash, Socket, "set", Key, Value, 0, 0);
-handle_call({setb, Key, Value, Flags, ExpTime}, _From, {Connections, CHash, Socket}) ->
-    storage_command(Connections, CHash, Socket, "set", Key, Value, Flags, ExpTime);
+handle_call({setb, Key, Value}, _From, #state{socket=Socket}) ->
+    storage_command(Socket, "set", Key, Value, 0, 0);
+handle_call({setb, Key, Value, Flags, ExpTime}, _From, #state{socket=Socket}) ->
+    storage_command(Socket, "set", Key, Value, Flags, ExpTime);
 
 
-handle_call({casb, Key, Value, Flags, ExpTime, CasUnique64}, _From, {Connections, CHash, Socket}) ->
-    storage_command(Connections, CHash, Socket, "set", Key, Value, Flags, ExpTime, CasUnique64);
+handle_call({casb, Key, Value, Flags, ExpTime, CasUnique64}, _From, #state{socket=Socket}) ->
+    storage_command(Socket, "set", Key, Value, Flags, ExpTime, CasUnique64);
 
 
-handle_call({replaceb, Key, Value}, _From, {Connections, CHash, Socket}) ->
-    storage_command(Connections, CHash, Socket, "replace", Key, Value, 0, 0);
-handle_call({replaceb, Key, Value, Flags, ExpTime}, _From, {Connections, CHash, Socket}) ->
-    storage_command(Connections, CHash, Socket, "replace", Key, Value, Flags, ExpTime);
+handle_call({replaceb, Key, Value}, _From, #state{socket=Socket}) ->
+    storage_command(Socket, "replace", Key, Value, 0, 0);
+handle_call({replaceb, Key, Value, Flags, ExpTime}, _From, #state{socket=Socket}) ->
+    storage_command(Socket, "replace", Key, Value, Flags, ExpTime);
 
-handle_call({addb, Key, Value}, _From, {Connections, CHash, Socket}) ->
-    storage_command(Connections, CHash, Socket, "add", Key, Value, 0, 0);
-handle_call({addb, Key, Value, Flags, ExpTime}, _From, {Connections, CHash, Socket}) ->
-    storage_command(Connections, CHash, Socket, "add", Key, Value, Flags, ExpTime);
-
-
-handle_call({append, Key, Value}, _From, {Connections, CHash, Socket}) ->
-    storage_command(Connections, CHash, Socket, "append", Key, term_to_binary(Value), 0, 0);
-handle_call({prepend, Key, Value}, _From, {Connections, CHash, Socket}) ->
-    storage_command(Connections, CHash, Socket, "prepend", Key, term_to_binary(Value), 0, 0);
+handle_call({addb, Key, Value}, _From, #state{socket=Socket}) ->
+    storage_command(Socket, "add", Key, Value, 0, 0);
+handle_call({addb, Key, Value, Flags, ExpTime}, _From, #state{socket=Socket}) ->
+    storage_command(Socket, "add", Key, Value, Flags, ExpTime);
 
 
-handle_call({delete, Key}, _From, {Connections, CHash, Socket}) ->
-    {reply, delete_command(Socket, Key), {Connections, CHash, Socket}};
-
-handle_call({incr, Key, Value}, _From, {Connections, CHash, Socket}) ->
-    {reply, incr_decr_command(Socket, "incr", Key, Value), {Connections, CHash, Socket}};
-handle_call({decr, Key, Value}, _From, {Connections, CHash, Socket}) ->
-    {reply, incr_decr_command(Socket, "decr", Key, Value), {Connections, CHash, Socket}};
+handle_call({append, Key, Value}, _From, #state{socket=Socket}) ->
+    storage_command(Socket, "append", Key, term_to_binary(Value), 0, 0);
+handle_call({prepend, Key, Value}, _From, #state{socket=Socket}) ->
+    storage_command(Socket, "prepend", Key, term_to_binary(Value), 0, 0);
 
 
-handle_call(disconnect, _From, {Connections, CHash, Socket}) ->
-    {stop, normal, ok, {Connections, CHash, Socket}};
+handle_call({delete, Key}, _From, #state{socket=Socket}=State) ->
+    {reply, delete_command(Socket, Key), #state{socket=Socket}=State};
+
+handle_call({incr, Key, Value}, _From, #state{socket=Socket}=State) ->
+    {reply, incr_decr_command(Socket, "incr", Key, Value), #state{socket=Socket}=State};
+handle_call({decr, Key, Value}, _From, #state{socket=Socket}=State) ->
+    {reply, incr_decr_command(Socket, "decr", Key, Value), #state{socket=Socket}=State};
 
 
-handle_call(version, _From, {Connections, CHash, Socket}) ->
-    gen_tcp:send(Socket, <<"version\r\n">>),
+handle_call(disconnect, _From, #state{socket=Socket}=State) ->
+    {stop, normal, ok, #state{socket=Socket}=State};
+
+
+handle_call(version, _From, #state{socket=Socket}=State) ->
+    ok=gen_tcp:send(Socket, <<"version\r\n">>),
     case gen_tcp:recv(Socket, 0, ?TIMEOUT) of
         {ok, Packet} ->
             case split(binary_to_list(Packet)) of
                 {Data, []} ->
                     case Data of
                         [$V | [$E | [$R | [$S | [$I | [$O | [$N | [32 | Version]]]]]]]] ->
-                            {reply, Version, {Connections, CHash, Socket}};
+                            {reply, Version, #state{socket=Socket}=State};
                         _ ->
-                            {reply, {error, invalid_reseponse}, {Connections, CHash, Socket}}
+                            {stop, {error, invalid_reseponse}, #state{socket=Socket}=State}
                     end;
                 Other ->
-                    {reply, Other, {Connections, CHash, Socket}}
+                    {stop, wtfd, Other, #state{socket=Socket}=State}
             end;
         {error, Reason} ->
-            {reply, {error, Reason}, {Connections, CHash, Socket}}
+            {stop,Reason, {error, Reason}, #state{socket=Socket}=State}
     end;
 
 
-handle_call(stats, _From, {Connections, CHash, Socket}) ->
-    gen_tcp:send(Socket, <<"stats\r\n">>),
+handle_call(stats, _From, #state{socket=Socket}=State) ->
+    ok=gen_tcp:send(Socket, <<"stats\r\n">>),
     case gen_tcp:recv(Socket, 0, ?TIMEOUT) of
         {ok, Packet} ->
             Stats = parse_stats(binary_to_list(Packet), []),
-            {reply, Stats, {Connections, CHash, Socket}};
+            {reply, Stats, #state{socket=Socket}=State};
         {error, Reason} ->
-            {reply, {error, Reason}, {Connections, CHash, Socket}}
+            {stop, {error, Reason}, #state{socket=Socket}=State}
     end;
 
 
-handle_call(quit, _From, {Connections, CHash, _Socket}) ->
-    lists:foreach(fun(Socket) -> gen_tcp:senc(Socket, <<"quit\r\n">>) end, all_sockets(Connections)),
-    {reply, ok, {Connections, CHash, _Socket}};
+handle_call(quit, _From, #state{socket=Socket}=State) ->
+    ok=gen_tcp:send(Socket, <<"quit\r\n">>),
+    {stop, normal, ok, State};
 %%     case get_socket(Key, Connections, CHash) of
 %%         {ok, Socket, NewConnections} ->
 %%             gen_tcp:send(Socket, <<"quit\r\n">>),
-%%             {reply, ok, {NewConnections, CHash, Socket}};
+%%             {reply, ok, State};
 %%         {error, Reason} ->
-%%             {reply, {error, Reason}, {NewConnections, CHash, Socket}}
+%%             {reply, {error, Reason}, State}
 %%     end;
 
 
-handle_call(flush_all, _From, {Connections, CHash, Socket}) ->
-    gen_tcp:send(Socket, <<"flush_all\r\n">>),
+handle_call(flush_all, _From, #state{socket=Socket}=State) ->
+    ok=gen_tcp:send(Socket, <<"flush_all\r\n">>),
     case gen_tcp:recv(Socket, 0, ?TIMEOUT) of
         {ok, Packet} ->
             case Packet of
                 <<"OK\r\n">> ->
-                    {reply, ok, {Connections, CHash, Socket}};
+                    {reply, ok, #state{socket=Socket}=State};
                 Other ->
-                    {reply, {error, Other}, {Connections, CHash, Socket}}
+                    {stop, {error, Other}, #state{socket=Socket}=State}
             end;
         Other ->
-            {error, Other}
+            {stop, {error, Other}, #state{socket=Socket}=State}
     end;
 
 
-handle_call({flush_all, Sec}, _From, {Connections, CHash, Socket}) ->
+handle_call({flush_all, Sec}, _From, #state{socket=Socket}=State) ->
     Command = iolist_to_binary([<<"flush_all ">>, integer_to_list(Sec), <<"\r\n">>]),
-    gen_tcp:send(Socket, Command),
+    ok=gen_tcp:send(Socket, Command),
     case gen_tcp:recv(Socket, 0, ?TIMEOUT) of
         {ok, Packet} ->
             case Packet of
                 <<"OK\r\n">> ->
-                    {reply, ok, {Connections, CHash, Socket}};
+                    {reply, ok, #state{socket=Socket}=State};
                 Other ->
-                    {reply, {error, Other}, {Connections, CHash, Socket}}
+                    {stop, {error, Other}, #state{socket=Socket}=State}
             end;
         Other ->
-            {error, Other}
+            {stop, {error, Other}, #state{socket=Socket}=State}
     end.
 
 
@@ -592,6 +573,10 @@ handle_cast(Msg, State) ->
 %%                                       {stop, Reason, State}
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
+handle_info(stop, State) ->
+    {stop, shutdown, State};
+handle_info({'EXIT', _, _}, State) ->
+    {stop, shutdown, State};
 handle_info(Info, State) ->
     io:format("info=~p~n", [Info]),
     {noreply, State}.
@@ -610,8 +595,9 @@ code_change(_OldVsn, State, _Extra) ->
 %% cleaning up. When it returns, the gen_server terminates with Reason.
 %% The return value is ignored.
 %%--------------------------------------------------------------------
-terminate(_Reason, {Connections, _CHash, _Socket}) ->
-    lists:foreach(fun(Socket) -> gen_tcp:close(Socket) end,  all_sockets(Connections)).
+terminate(_Reason, #state{socket=Socket}) ->
+    gen_tcp:close(Socket),
+    ok.
 
 %%====================================================================
 %% Internal functions
@@ -674,17 +660,15 @@ parse_stats(Data, Stats) ->
             end
     end.
 
-storage_command(Connections, CHash, Socket, Command, Key, Value, Flags, ExpTime) when is_integer(Flags) andalso is_integer(ExpTime) ->
+storage_command(Socket, Command, Key, Value, Flags, ExpTime) when is_integer(Flags) andalso is_integer(ExpTime) ->
     EmptyCasUnique64 = <<>>,
-    storage_command(Connections, CHash, Socket, Command, Key, Value, Flags, ExpTime, EmptyCasUnique64).
-storage_command(Connections, CHash, _Socket, Command, Key, Value, Flags, ExpTime, CasUnique64) when is_integer(Flags) andalso is_integer(ExpTime) ->
-    call_with_socket(
-      fun(Socket, NewConnections) ->
+    storage_command(Socket, Command, Key, Value, Flags, ExpTime, EmptyCasUnique64).
+storage_command(Socket, Command, Key, Value, Flags, ExpTime, CasUnique64) when is_integer(Flags) andalso is_integer(ExpTime) ->
               ValueAsBinary = Value,
               Bytes = integer_to_list(size(ValueAsBinary)),
               CommandAsBinary = iolist_to_binary([Command, <<" ">>, Key, <<" ">>, integer_to_list(Flags), <<" ">>, integer_to_list(ExpTime), <<" ">>, Bytes, <<" ">>, CasUnique64]),
-              gen_tcp:send(Socket, <<CommandAsBinary/binary, "\r\n">>),
-              gen_tcp:send(Socket, <<ValueAsBinary/binary, "\r\n">>),
+              ok=gen_tcp:send(Socket, <<CommandAsBinary/binary, "\r\n">>),
+              ok=gen_tcp:send(Socket, <<ValueAsBinary/binary, "\r\n">>),
               {reply,
                case gen_tcp:recv(Socket, 0, ?TIMEOUT) of
                    {ok, Packet} ->
@@ -705,15 +689,13 @@ storage_command(Connections, CHash, _Socket, Command, Key, Value, Flags, ExpTime
                    {error, Reason} ->
                        {error, Reason}
               end,
-               {NewConnections, CHash, _Socket}}
-      end,
-      Key, Connections, CHash, _Socket).
+               #state{socket=Socket}}.
 
 
 %% memcached 1.4.0 or higher doesn't support time argument.
 delete_command(Socket, Key) ->
     Command = iolist_to_binary([<<"delete ">>, Key]),
-    gen_tcp:send(Socket, <<Command/binary, "\r\n">>),
+    ok=gen_tcp:send(Socket, <<Command/binary, "\r\n">>),
     case gen_tcp:recv(Socket, 0, ?TIMEOUT) of
         {ok, <<"DELETED\r\n">>} ->
             ok;
@@ -727,7 +709,7 @@ delete_command(Socket, Key) ->
 
 get_command(Socket, GetCommand, Keys) ->
     Command = iolist_to_binary([GetCommand, <<" ">>, string_join(" ", Keys)]),
-    gen_tcp:send(Socket, <<Command/binary, "\r\n">>),
+    ok=gen_tcp:send(Socket, <<Command/binary, "\r\n">>),
     case gen_tcp:recv(Socket, 0, ?TIMEOUT) of
         {ok, Packet} ->
             parse_values(binary_to_list(Packet));
@@ -738,7 +720,7 @@ get_command(Socket, GetCommand, Keys) ->
 
 incr_decr_command(Socket, IncrDecr, Key, Value) ->
     Command = iolist_to_binary([IncrDecr, " ", Key, " ", list_to_binary(integer_to_list(Value)), " "]),
-    gen_tcp:send(Socket, <<Command/binary, "\r\n">>),
+    ok=gen_tcp:send(Socket, <<Command/binary, "\r\n">>),
     case gen_tcp:recv(Socket, 0, ?TIMEOUT) of
         {ok, Packet} ->
             case split(binary_to_list(Packet)) of
@@ -759,45 +741,17 @@ incr_decr_command(Socket, IncrDecr, Key, Value) ->
     end.
 
 
-get_socket(Key, Connections, CHash) ->
-    Server = chash:get_node(CHash, Key),
-    case ets:lookup(Connections, Server) of
-        [{Server, {Host, Port}}] ->
-            case gen_tcp:connect(Host, Port, ?TCP_OPTIONS) of
-                {ok, Socket} ->
-                    Server = Host ++ integer_to_list(Port),
-                    true = ets:insert(Connections, {Server, Socket}),
-                    {ok, Socket, Connections};
-                {error, Reason} ->
-                    {error, Reason};
-                Other ->
-                    {error, Other}
-            end;
-        [{Server, Socket}] ->
-            {ok, Socket, Connections}
-    end.
-
-all_sockets(Connections) ->
-    ets:foldr(fun(X, Accum) ->
-                      case X of
-                          {_Host, _Port} ->
-                              Accum;
-                          Socket -> [Socket | Accum]
-                      end
-              end,
-              [],
-              Connections).
 
 
-filter_map(_Fun, []) ->
-    [];
-filter_map(Fun, [Elem | Rest]) ->
-    case apply(Fun, [Elem]) of
-        false ->
-            filter_map(Fun, Rest);
-        X ->
-            [X | filter_map(Fun, Rest)]
-    end.
+%% filter_map(_Fun, []) ->
+%%     [];
+%% filter_map(Fun, [Elem | Rest]) ->
+%%     case apply(Fun, [Elem]) of
+%%         false ->
+%%             filter_map(Fun, Rest);
+%%         X ->
+%%             [X | filter_map(Fun, Rest)]
+%%     end.
 
 %% Borrowed from http://www.trapexit.org/String_join_with
 string_join(Join, L) ->
