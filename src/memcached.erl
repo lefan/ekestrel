@@ -72,6 +72,9 @@
 -define(CR, 13).
 -define(LF, 10).
 
+-define(DEBUG(Format, Args),io:format("~s.~w: DEBUG: " ++ Format, [ ?MODULE, ?LINE | Args])).
+%-define(DEBUG(Format, Args), true).
+
 %%====================================================================
 %% API
 %%====================================================================

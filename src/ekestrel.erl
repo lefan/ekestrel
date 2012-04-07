@@ -29,6 +29,9 @@ start(_StartType, _StartArgs) ->
 
 stop(_State) ->
     ok.
+%% Helper macro for declaring children of supervisor
+-define(CHILD(I, Type), {I, {I, start_link, []}, permanent, 5000, Type, [I]}).
+-define(CHILD_SUP(I), {I, {I, start_link, []}, permanent, infinity, supervisor, [I]}).
 
 %% ===================================================================
 %% API functions
@@ -42,12 +45,6 @@ start_link() ->
 %% ===================================================================
 
 init([]) ->
-    {ok, Pools} = application:get_env(ekestrel, pools),
-    PoolSpecs = lists:map(fun({PoolName, PoolConfig}) ->
-				  Args = [{name, {local, PoolName}},
-					  {worker_module, memcached}]
-				      ++ PoolConfig,
-				  {PoolName, {poolboy, start_link, [Args]},
-				   temporary, 5000, worker, [poolboy]}
-			  end, Pools),
-    {ok, { {one_for_one, 10, 10}, PoolSpecs} }.
+    Ekman=?CHILD(ekman,worker),
+    Poolboy_sup=?CHILD_SUP(ek_pb_sup),
+    {ok, { {one_for_all, 10, 10}, [Poolboy_sup, Ekman]} }.

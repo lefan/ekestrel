@@ -4,9 +4,12 @@
               {registered,[]},
               {applications,[kernel,stdlib]},
               {mod,{ekestrel,[]}},
-              {env,[{pools,[{kestr1,[{size,1},
-                                     {max_overflow,0},
-                                     {hostname,"127.0.0.1"},
-                                     {port,11211}]}]}]},
-              {modules,[chash,ekestrel,ekestrel_app,ekestrel_sup,memcached,
-                        memcached_worker]}]}.
+              {env,[{pools,[{k1,[{size,3},
+                                 {max_overflow,0},
+                                 {hostname,"127.0.0.1"},
+                                 {port,11211}]},
+                            {k2,[{size,2},
+                                 {max_overflow,0},
+                                 {hostname,"127.0.0.1"},
+                                 {port,11311}]}]}]},
+              {modules,[ek_pb_sup,ekestrel,ekman,memcached]}]}.
